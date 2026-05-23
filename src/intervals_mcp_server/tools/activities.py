@@ -25,6 +25,24 @@ from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_da
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
 
+from zoneinfo import ZoneInfo  # stdlib, Python 3.9+ — no install needed
+
+def _convert_activity_dates_to_local(
+    activities: list[dict[str, Any]], timezone: str
+) -> list[dict[str, Any]]:
+    """Convert UTC date fields on activities to the athlete's local timezone."""
+    tz = ZoneInfo(timezone)
+    for activity in activities:
+        for field in ("start_date_local", "startTime", "start_date"):
+            raw = activity.get(field)
+            if raw and isinstance(raw, str):
+                try:
+                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    activity[field] = dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, KeyError):
+                    pass
+    return activities
+
 config = get_config()
 
 
@@ -142,6 +160,14 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
     start_date, end_date = resolve_date_params(start_date, end_date)
 
+    # Fetch athlete timezone for local date conversion
+    athlete_result = await make_intervals_request(
+        url=f"/athlete/{athlete_id_to_use}", api_key=api_key
+    )
+    athlete_timezone = "UTC"
+    if isinstance(athlete_result, dict) and "timezone" in athlete_result:
+        athlete_timezone = athlete_result["timezone"]
+    
     # Fetch more activities if we need to filter out unnamed ones
     api_limit = limit * 3 if not include_unnamed else limit
 
@@ -162,6 +188,9 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
     # Parse activities from result
     activities = _parse_activities_from_result(result)
 
+    # Convert UTC timestamps to athlete's local timezone
+    activities = _convert_activity_dates_to_local(activities, athlete_timezone)
+    
     if not activities:
         return f"No valid activities found for athlete {athlete_id_to_use} in the specified date range."
 
