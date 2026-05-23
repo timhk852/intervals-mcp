@@ -1,0 +1,15 @@
+services:
+  app:
+    container_name: intervals-mcp
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - MCP_TRANSPORT=http
+      - FASTMCP_HOST=0.0.0.0
+      - FASTMCP_PORT=8000
+      - ATHLETE_ID=i344810
+      - API_KEY=
+    ports:
+      - "80:8000"
+    restart: unless-stopped
