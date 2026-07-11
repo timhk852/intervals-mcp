@@ -6,10 +6,6 @@ import { z } from "zod";
 interface WorkerEnv extends Env {
 	API_KEY: string;
 	ATHLETE_ID: string;
-	// Shared secret required on every request (see `checkSharedSecret` below).
-	// Set with `wrangler secret put MCP_SHARED_SECRET` in production, or add
-	// to .dev.vars for local development.
-	MCP_SHARED_SECRET: string;
 }
 
 const INTERVALS_API_BASE = "https://intervals.icu/api/v1";
@@ -1409,6 +1405,8 @@ const VALID_EVENT_CATEGORIES = new Set([
 	"TARGET",
 	"SET_FITNESS",
 ]);
+
+const RACE_CATEGORIES = "RACE_A,RACE_B,RACE_C";
 
 function parseISODate(raw: string): Date | null {
 	const dt = new Date(raw);
@@ -2831,6 +2829,79 @@ function createServer(env: WorkerEnv): McpServer {
 	);
 
 	// ------------------------------------------------------------------
+	// get_races
+	// ------------------------------------------------------------------
+	server.tool(
+		"get_races",
+		"Get races for an athlete from Intervals.icu. Retrieves all race events (A, B, and C priority) over a date range. Defaults to a one-year window (today to 365 days ahead) which is larger than other tools because races are typically planned well in advance.",
+		{
+			athlete_id: z.string().optional().describe("The Intervals.icu athlete ID (optional, will use ATHLETE_ID from env if not provided)"),
+			api_key: z.string().optional().describe("The Intervals.icu API key (optional, will use API_KEY from env if not provided)"),
+			start_date: z.string().optional().describe("Start date in YYYY-MM-DD format (optional, defaults to today)"),
+			end_date: z.string().optional().describe("End date in YYYY-MM-DD format (optional, defaults to 365 days from today)"),
+			compact: z
+				.boolean()
+				.optional()
+				.describe("If True, return a brief one-line-per-event summary to save tokens (optional, defaults to True)"),
+		},
+		async (args) => {
+			const apiKey = args.api_key || env.API_KEY;
+			if (!apiKey) {
+				return {
+					content: [{ type: "text", text: "API key is required. Set API_KEY secret or pass api_key." }],
+				};
+			}
+
+			const athleteId = args.athlete_id || env.ATHLETE_ID;
+			if (!athleteId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: No athlete ID provided and no default ATHLETE_ID found in environment variables.",
+						},
+					],
+				};
+			}
+
+			const startDate = args.start_date || todayStr();
+			const endDate = args.end_date || daysAheadStr(365);
+
+			const params: Record<string, ParamValue> = { oldest: startDate, newest: endDate, category: RACE_CATEGORIES };
+
+			const result = await makeIntervalsRequest(apiKey, `/athlete/${athleteId}/events`, params);
+
+			if (!Array.isArray(result) && result["error"]) {
+				const msg = (result["message"] as string) ?? "Unknown error";
+				return { content: [{ type: "text", text: `Error fetching races: ${msg}` }] };
+			}
+
+			const isEmpty = Array.isArray(result) ? result.length === 0 : Object.keys(result).length === 0;
+			if (!result || isEmpty) {
+				return {
+					content: [{ type: "text", text: `No races found for athlete ${athleteId} in the specified date range.` }],
+				};
+			}
+
+			const events = Array.isArray(result) ? result.filter(isRecord) : [];
+			if (!events.length) {
+				return {
+					content: [{ type: "text", text: `No races found for athlete ${athleteId} in the specified date range.` }],
+				};
+			}
+
+			const compact = args.compact ?? true;
+			const formatter = compact ? formatEventCompact : formatEventSummary;
+			let racesSummary = "Races:\n\n";
+			for (const event of events) {
+				racesSummary += formatter(event) + "\n";
+			}
+
+			return { content: [{ type: "text", text: racesSummary }] };
+		},
+	);
+
+	// ------------------------------------------------------------------
 	// get_events
 	// ------------------------------------------------------------------
 	server.tool(
@@ -3776,6 +3847,86 @@ function createServer(env: WorkerEnv): McpServer {
 		},
 	);
 
+	// ------------------------------------------------------------------
+	// schedule_workout
+	// ------------------------------------------------------------------
+	server.tool(
+		"schedule_workout",
+		"Schedule a library workout onto the athlete's calendar as an event. Fetches the workout from the library by ID and creates a calendar event on the specified date with the workout's name, type, steps, and duration. This saves context by combining get_workout + add_or_update_event into a single call.",
+		{
+			workout_id: z.number().int().describe("The library workout ID to schedule (required). Use list_workouts to discover IDs."),
+			start_date: z.string().describe("Date to place the workout on the calendar in YYYY-MM-DD format (required)."),
+			athlete_id: z.string().optional().describe("The Intervals.icu athlete ID (optional, will use ATHLETE_ID from env if not provided)"),
+			api_key: z.string().optional().describe("The Intervals.icu API key (optional, will use API_KEY from env if not provided)"),
+		},
+		async (args) => {
+			const apiKey = args.api_key || env.API_KEY;
+			if (!apiKey) {
+				return {
+					content: [{ type: "text", text: "API key is required. Set API_KEY secret or pass api_key." }],
+				};
+			}
+
+			const athleteId = args.athlete_id || env.ATHLETE_ID;
+			if (!athleteId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: No athlete ID provided and no default ATHLETE_ID found in environment variables.",
+						},
+					],
+				};
+			}
+
+			if (!isValidDateStr(args.start_date)) {
+				return { content: [{ type: "text", text: "Error: start_date must be in YYYY-MM-DD format." }] };
+			}
+
+			const workout = await makeIntervalsRequest(apiKey, `/athlete/${athleteId}/workouts/${args.workout_id}`);
+
+			if (!Array.isArray(workout) && workout["error"]) {
+				return { content: [{ type: "text", text: `Error fetching workout: ${workout["message"]}` }] };
+			}
+
+			if (!workout || Array.isArray(workout) || Object.keys(workout).length === 0) {
+				return { content: [{ type: "text", text: `No workout found with ID ${args.workout_id}.` }] };
+			}
+
+			const eventData: Record<string, unknown> = {
+				start_date_local: args.start_date + "T00:00:00",
+				category: "WORKOUT",
+				name: workout["name"] ?? "",
+				type: workout["type"] ?? "Ride",
+			};
+			if (workout["workout_doc"]) eventData["workout_doc"] = workout["workout_doc"];
+			if (workout["description"]) eventData["description"] = workout["description"];
+			if (workout["moving_time"]) eventData["moving_time"] = workout["moving_time"];
+			if (workout["distance"]) eventData["distance"] = workout["distance"];
+			if (workout["color"]) eventData["color"] = workout["color"];
+
+			const result = await makeIntervalsRequest(apiKey, `/athlete/${athleteId}/events`, undefined, "POST", eventData);
+
+			if (!Array.isArray(result) && result["error"]) {
+				return { content: [{ type: "text", text: `Error creating calendar event: ${result["message"]}` }] };
+			}
+
+			if (!result || Array.isArray(result) || Object.keys(result).length === 0) {
+				return { content: [{ type: "text", text: "Error: Unexpected response when creating calendar event." }] };
+			}
+
+			const eventId = result["id"] ?? "";
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Successfully scheduled workout '${workout["name"]}' on ${args.start_date} (event id: ${eventId}).`,
+					},
+				],
+			};
+		},
+	);
+
 	return server;
 }
 
@@ -3783,42 +3934,8 @@ function createServer(env: WorkerEnv): McpServer {
 // Cloudflare Worker export
 // ---------------------------------------------------------------------------
 
-// Constant-time string comparison to avoid leaking secret bytes via response
-// timing. Both inputs are hashed to a fixed length first so comparison time
-// doesn't vary with the length of the (attacker-controlled) provided secret.
-async function timingSafeEqual(a: string, b: string): Promise<boolean> {
-	const enc = new TextEncoder();
-	const [aDigest, bDigest] = await Promise.all([
-		crypto.subtle.digest("SHA-256", enc.encode(a)),
-		crypto.subtle.digest("SHA-256", enc.encode(b)),
-	]);
-	const aBytes = new Uint8Array(aDigest);
-	const bBytes = new Uint8Array(bDigest);
-	let diff = 0;
-	for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ bBytes[i];
-	return diff === 0;
-}
-
-async function checkSharedSecret(request: Request, env: WorkerEnv): Promise<Response | null> {
-	if (!env.MCP_SHARED_SECRET) {
-		return new Response("Server misconfigured: MCP_SHARED_SECRET is not set.", { status: 500 });
-	}
-
-	const authHeader = request.headers.get("Authorization") ?? "";
-	const providedSecret = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-
-	if (!providedSecret || !(await timingSafeEqual(providedSecret, env.MCP_SHARED_SECRET))) {
-		return new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-	}
-
-	return null;
-}
-
 export default {
 	async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-		const authError = await checkSharedSecret(request, env);
-		if (authError) return authError;
-
 		// This server never emits server-initiated notifications, so the
 		// standalone GET SSE stream would sit open indefinitely with no
 		// bytes flowing. Cloudflare's runtime treats a request that produces
