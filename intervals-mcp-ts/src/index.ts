@@ -969,6 +969,14 @@ function createServer(env: WorkerEnv): McpServer {
 
 export default {
 	async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+		// This server never emits server-initiated notifications, so the
+		// standalone GET SSE stream would sit open indefinitely with no
+		// bytes flowing. Cloudflare's runtime treats a request that produces
+		// no output for ~30s as hung and kills it, so we don't serve GET.
+		if (request.method === "GET") {
+			return new Response("Method Not Allowed", { status: 405, headers: { Allow: "POST" } });
+		}
+
 		const server = createServer(env);
 		const transport = new WebStandardStreamableHTTPServerTransport({
 			sessionIdGenerator: undefined, // stateless
