@@ -1028,6 +1028,88 @@ function buildTrainingSummaryResult(
 }
 
 // ---------------------------------------------------------------------------
+// TS-ONLY ADDITION — not present in the Python source.
+//
+// Shared fetch+aggregate step for a single training-summary period, factored
+// out of the `get_training_summary` tool handler so `compare_training_periods`
+// (added below, also TS-only) can reuse it to build two periods without
+// duplicating the fetch/error-handling logic. `get_training_summary` itself
+// was refactored to call this helper too — its behavior/output is unchanged.
+// ---------------------------------------------------------------------------
+
+async function fetchTrainingSummaryForPeriod(
+	apiKey: string,
+	athleteId: string,
+	startDate: string,
+	endDate: string,
+): Promise<{ result: Record<string, unknown> } | { error: string }> {
+	if (!isValidDateStr(startDate) || !isValidDateStr(endDate)) {
+		return { error: "Error: Invalid date format. Please use YYYY-MM-DD." };
+	}
+
+	const [summaryRaw, activitiesRaw, wellnessRaw, eventsRaw] = await Promise.all([
+		makeIntervalsRequest(apiKey, `/athlete/${athleteId}/athlete-summary`, { start: startDate, end: endDate }),
+		makeIntervalsRequest(apiKey, `/athlete/${athleteId}/activities`, { oldest: startDate, newest: endDate }),
+		makeIntervalsRequest(apiKey, `/athlete/${athleteId}/wellness`, { oldest: startDate, newest: endDate }),
+		makeIntervalsRequest(apiKey, `/athlete/${athleteId}/events`, { oldest: startDate, newest: endDate }),
+	]);
+
+	for (const [label, raw] of [
+		["athlete-summary", summaryRaw],
+		["activities", activitiesRaw],
+		["wellness", wellnessRaw],
+		["events", eventsRaw],
+	] as const) {
+		if (!Array.isArray(raw) && raw["error"]) {
+			const msg = (raw["message"] as string) ?? "Unknown error";
+			return { error: `Error fetching ${label}: ${msg}` };
+		}
+	}
+
+	const summaryWeeks = Array.isArray(summaryRaw) ? (summaryRaw as Activity[]) : [];
+	const activitiesList = Array.isArray(activitiesRaw) ? (activitiesRaw as Activity[]) : [];
+	const wellnessList = Array.isArray(wellnessRaw) ? (wellnessRaw as Activity[]) : [];
+	const eventsList = Array.isArray(eventsRaw) ? (eventsRaw as Activity[]) : [];
+
+	summaryWeeks.sort((a, b) => String(a["date"] ?? "").localeCompare(String(b["date"] ?? "")));
+
+	const today = new Date();
+	const result = buildTrainingSummaryResult(summaryWeeks, activitiesList, wellnessList, eventsList, startDate, endDate, today);
+
+	return { result };
+}
+
+// ---------------------------------------------------------------------------
+// TS-ONLY ADDITION — not present in the Python source.
+//
+// Helpers backing `compare_training_periods`: pick a by_sport entry
+// case-insensitively (defaulting to zeroes when a sport had no activity in a
+// period) and compute a flat numeric delta between two same-shaped objects.
+// ---------------------------------------------------------------------------
+
+function pickSportTotals(periodTotals: Record<string, unknown>, activityType: string): Record<string, unknown> {
+	const bySport = periodTotals["by_sport"];
+	const zero = { count: 0, tss: 0, duration_secs: 0 };
+	if (!isRecord(bySport)) return zero;
+	const typeLower = activityType.toLowerCase();
+	for (const [name, totals] of Object.entries(bySport)) {
+		if (name.toLowerCase() === typeLower && isRecord(totals)) return totals;
+	}
+	return zero;
+}
+
+function numericDelta(a: Record<string, unknown>, b: Record<string, unknown>): Record<string, number> {
+	const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+	const delta: Record<string, number> = {};
+	for (const key of keys) {
+		const av = typeof a[key] === "number" ? (a[key] as number) : 0;
+		const bv = typeof b[key] === "number" ? (b[key] as number) : 0;
+		delta[key] = roundTo(bv - av, 1);
+	}
+	return delta;
+}
+
+// ---------------------------------------------------------------------------
 // Power curve formatting (ported from Python tools/power_curves.py)
 // ---------------------------------------------------------------------------
 
@@ -2608,54 +2690,112 @@ function createServer(env: WorkerEnv): McpServer {
 			const startDate = args.start_date || daysAgoStr(30);
 			const endDate = args.end_date || daysAheadStr(30);
 
-			if (!isValidDateStr(startDate) || !isValidDateStr(endDate)) {
+			const outcome = await fetchTrainingSummaryForPeriod(apiKey, athleteId, startDate, endDate);
+			if ("error" in outcome) {
+				return { content: [{ type: "text", text: outcome.error }] };
+			}
+
+			return { content: [{ type: "text", text: JSON.stringify(outcome.result) }] };
+		},
+	);
+
+	// ------------------------------------------------------------------
+	// compare_training_periods
+	// TS-ONLY ADDITION — not present in the Python source. Added 2026-07-11
+	// per user request, sitting on top of the ported get_training_summary
+	// machinery (fetchTrainingSummaryForPeriod / buildTrainingSummaryResult
+	// above). See conversation history for the design rationale: reuses
+	// get_training_summary's aggregation for two periods, drops the
+	// week-by-week breakdown to keep output compact, and omits pct_change
+	// (raw deltas only) since percentage change on signed metrics like TSB
+	// is misleading.
+	// ------------------------------------------------------------------
+	server.tool(
+		"compare_training_periods",
+		"Compare training load and volume between two date ranges (e.g. two race build-ups). Returns CTL/ATL/TSB at the end of each period plus volume totals (sessions, TSS, duration, distance, elevation), with a delta between period B and period A for each metric. Optionally filter volume totals to a single activity type (e.g. \"Run\") — note that CTL/ATL/TSB always remain whole-athlete metrics since Intervals.icu's PMC model isn't split by sport. Lighter-weight than two get_training_summary calls since the week-by-week breakdown is omitted.",
+		{
+			period_a_start: z.string().describe("Start date of period A in YYYY-MM-DD format"),
+			period_a_end: z.string().describe("End date of period A in YYYY-MM-DD format"),
+			period_b_start: z.string().describe("Start date of period B in YYYY-MM-DD format"),
+			period_b_end: z.string().describe("End date of period B in YYYY-MM-DD format"),
+			activity_type: z
+				.string()
+				.optional()
+				.describe(
+					'Filter volume totals to a single activity type, e.g. "Run", "Ride" (optional, case-insensitive). When omitted, totals cover all activity types combined.',
+				),
+			athlete_id: z.string().optional().describe("Intervals.icu athlete ID (optional, falls back to ATHLETE_ID env var)"),
+			api_key: z.string().optional().describe("Intervals.icu API key (optional, falls back to API_KEY env var)"),
+		},
+		async (args) => {
+			const apiKey = args.api_key || env.API_KEY;
+			if (!apiKey) {
 				return {
-					content: [{ type: "text", text: "Error: Invalid date format. Please use YYYY-MM-DD." }],
+					content: [{ type: "text", text: "API key is required. Set API_KEY secret or pass api_key." }],
 				};
 			}
 
-			const [summaryRaw, activitiesRaw, wellnessRaw, eventsRaw] = await Promise.all([
-				makeIntervalsRequest(apiKey, `/athlete/${athleteId}/athlete-summary`, {
-					start: startDate,
-					end: endDate,
-				}),
-				makeIntervalsRequest(apiKey, `/athlete/${athleteId}/activities`, {
-					oldest: startDate,
-					newest: endDate,
-				}),
-				makeIntervalsRequest(apiKey, `/athlete/${athleteId}/wellness`, {
-					oldest: startDate,
-					newest: endDate,
-				}),
-				makeIntervalsRequest(apiKey, `/athlete/${athleteId}/events`, {
-					oldest: startDate,
-					newest: endDate,
-				}),
-			]);
-
-			for (const [label, raw] of [
-				["athlete-summary", summaryRaw],
-				["activities", activitiesRaw],
-				["wellness", wellnessRaw],
-				["events", eventsRaw],
-			] as const) {
-				if (!Array.isArray(raw) && raw["error"]) {
-					const msg = (raw["message"] as string) ?? "Unknown error";
-					return { content: [{ type: "text", text: `Error fetching ${label}: ${msg}` }] };
-				}
+			const athleteId = args.athlete_id || env.ATHLETE_ID;
+			if (!athleteId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: No athlete ID provided and no default ATHLETE_ID found in environment variables.",
+						},
+					],
+				};
 			}
 
-			const summaryWeeks = Array.isArray(summaryRaw) ? (summaryRaw as Activity[]) : [];
-			const activitiesList = Array.isArray(activitiesRaw) ? (activitiesRaw as Activity[]) : [];
-			const wellnessList = Array.isArray(wellnessRaw) ? (wellnessRaw as Activity[]) : [];
-			const eventsList = Array.isArray(eventsRaw) ? (eventsRaw as Activity[]) : [];
+			const [outcomeA, outcomeB] = await Promise.all([
+				fetchTrainingSummaryForPeriod(apiKey, athleteId, args.period_a_start, args.period_a_end),
+				fetchTrainingSummaryForPeriod(apiKey, athleteId, args.period_b_start, args.period_b_end),
+			]);
 
-			summaryWeeks.sort((a, b) => String(a["date"] ?? "").localeCompare(String(b["date"] ?? "")));
+			if ("error" in outcomeA) {
+				return { content: [{ type: "text", text: `Period A: ${outcomeA.error}` }] };
+			}
+			if ("error" in outcomeB) {
+				return { content: [{ type: "text", text: `Period B: ${outcomeB.error}` }] };
+			}
 
-			const today = new Date();
-			const result = buildTrainingSummaryResult(summaryWeeks, activitiesList, wellnessList, eventsList, startDate, endDate, today);
+			const loadA = (outcomeA.result["load"] as Record<string, unknown> | undefined)?.["end"] as Record<string, unknown> | undefined;
+			const loadB = (outcomeB.result["load"] as Record<string, unknown> | undefined)?.["end"] as Record<string, unknown> | undefined;
+			const loadAEnd = loadA ?? {};
+			const loadBEnd = loadB ?? {};
 
-			return { content: [{ type: "text", text: JSON.stringify(result) }] };
+			const totalsA = (outcomeA.result["period_totals"] as Record<string, unknown> | undefined) ?? {};
+			const totalsB = (outcomeB.result["period_totals"] as Record<string, unknown> | undefined) ?? {};
+
+			let periodATotals = totalsA;
+			let periodBTotals = totalsB;
+			if (args.activity_type) {
+				periodATotals = pickSportTotals(totalsA, args.activity_type);
+				periodBTotals = pickSportTotals(totalsB, args.activity_type);
+			}
+
+			const comparison: Record<string, unknown> = {
+				period_a: { start: args.period_a_start, end: args.period_a_end },
+				period_b: { start: args.period_b_start, end: args.period_b_end },
+				load: {
+					...(args.activity_type
+						? {
+								note: "CTL/ATL/TSB are whole-athlete metrics — Intervals.icu doesn't split PMC by sport, so these remain whole-athlete even though totals below are filtered.",
+							}
+						: {}),
+					period_a_end: loadAEnd,
+					period_b_end: loadBEnd,
+					delta: numericDelta(loadAEnd, loadBEnd),
+				},
+				totals: {
+					period_a: periodATotals,
+					period_b: periodBTotals,
+					delta: numericDelta(periodATotals, periodBTotals),
+				},
+			};
+			if (args.activity_type) comparison["activity_type"] = args.activity_type;
+
+			return { content: [{ type: "text", text: JSON.stringify(comparison) }] };
 		},
 	);
 
