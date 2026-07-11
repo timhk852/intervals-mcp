@@ -1,0 +1,4 @@
+API_KEY=your-intervals-icu-api-key
+ATHLETE_ID=i000000
+# Generate with: openssl rand -hex 32
+MCP_SHARED_SECRET=change-me

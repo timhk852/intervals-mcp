@@ -6,6 +6,10 @@ import { z } from "zod";
 interface WorkerEnv extends Env {
 	API_KEY: string;
 	ATHLETE_ID: string;
+	// Shared secret required on every request (see `checkSharedSecret` below).
+	// Set with `wrangler secret put MCP_SHARED_SECRET` in production, or add
+	// to .dev.vars for local development.
+	MCP_SHARED_SECRET: string;
 }
 
 const INTERVALS_API_BASE = "https://intervals.icu/api/v1";
@@ -3779,8 +3783,42 @@ function createServer(env: WorkerEnv): McpServer {
 // Cloudflare Worker export
 // ---------------------------------------------------------------------------
 
+// Constant-time string comparison to avoid leaking secret bytes via response
+// timing. Both inputs are hashed to a fixed length first so comparison time
+// doesn't vary with the length of the (attacker-controlled) provided secret.
+async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+	const enc = new TextEncoder();
+	const [aDigest, bDigest] = await Promise.all([
+		crypto.subtle.digest("SHA-256", enc.encode(a)),
+		crypto.subtle.digest("SHA-256", enc.encode(b)),
+	]);
+	const aBytes = new Uint8Array(aDigest);
+	const bBytes = new Uint8Array(bDigest);
+	let diff = 0;
+	for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ bBytes[i];
+	return diff === 0;
+}
+
+async function checkSharedSecret(request: Request, env: WorkerEnv): Promise<Response | null> {
+	if (!env.MCP_SHARED_SECRET) {
+		return new Response("Server misconfigured: MCP_SHARED_SECRET is not set.", { status: 500 });
+	}
+
+	const authHeader = request.headers.get("Authorization") ?? "";
+	const providedSecret = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+
+	if (!providedSecret || !(await timingSafeEqual(providedSecret, env.MCP_SHARED_SECRET))) {
+		return new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+	}
+
+	return null;
+}
+
 export default {
 	async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+		const authError = await checkSharedSecret(request, env);
+		if (authError) return authError;
+
 		// This server never emits server-initiated notifications, so the
 		// standalone GET SSE stream would sit open indefinitely with no
 		// bytes flowing. Cloudflare's runtime treats a request that produces
